@@ -51,15 +51,20 @@
 @property BOOL isInline;
 @property BOOL clearBadge;
 @property (nonatomic, strong) NSDictionary *handlerObj;
+@property (nonatomic, retain) NSDictionary  *launchNotification;
 
 - (void)init:(CDVInvokedUrlCommand*)command;
 - (void)unregister:(CDVInvokedUrlCommand*)command;
 
-- (void)didRegisterForRemoteNotificationsWithDeviceToken:(NSData *)deviceToken;
-- (void)didFailToRegisterForRemoteNotificationsWithError:(NSError *)error;
+- (void)application:(UIApplication*)app didRegisterForRemoteNotificationsWithDeviceToken:(NSData*)deviceToken;
+- (void)didFailToRegisterForRemoteNotificationsWithError:(NSError*)error;
+- (void)applicationDidBecomeActive:(UIApplication *)application;
+- (void)application:(UIApplication *)application didReceiveRemoteNotification:(NSDictionary *)userInfo fetchCompletionHandler:( void (^)(UIBackgroundFetchResult))completionHandler;
 
 - (void)setNotificationMessage:(NSDictionary *)notification;
 - (void)notificationReceived;
+
+- (id) getCommandInstance:(NSString*)className;
 
 //  GCM Features
 @property(nonatomic, assign) BOOL usesGCM;

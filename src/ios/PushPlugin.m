@@ -28,8 +28,9 @@
 
 #import "PushPlugin.h"
 #import "CloudMessaging.h"
+#import <objc/runtime.h>
 
-@implementation PushPlugin
+@implementation PushPlugin: CDVPlugin
 
 @synthesize notificationMessage;
 @synthesize isInline;
@@ -47,6 +48,13 @@
 @synthesize gcmRegistrationHandler;
 @synthesize gcmRegistrationToken;
 @synthesize gcmTopics;
+
+static char launchNotificationKey;
+
+static BOOL registerSuccessMethodFound = NO;
+static BOOL registeFailMethodFound = NO;
+static BOOL receivedNotifFound = NO;
+static BOOL becomeActiveFound = NO;
 
 -(void)initGCMRegistrationHandler;
 {
@@ -100,7 +108,6 @@
 #endif
 }
 
-// [START upstream_callbacks]
 - (void)willSendDataMessageWithID:(NSString *)messageID error:(NSError *)error {
     NSLog(@"willSendDataMessageWithID");
     if (error) {
@@ -114,13 +121,60 @@
     NSLog(@"willSendDataMessageWithID");
     // Did successfully send message identified by messageID
 }
-// [END upstream_callbacks]
 
 - (void)didDeleteMessagesOnServer {
     NSLog(@"didDeleteMessagesOnServer");
     // Some messages sent to this device were deleted on the GCM server before reception, likely
     // because the TTL expired. The client should notify the app server of this, so that the app
     // server can resend those messages.
+}
+
++ (void)load
+{
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+
+        unsigned int numberOfClasses = 0;
+        Class *classes = objc_copyClassList(&numberOfClasses);
+        Class appDelegateClass = nil;
+        for (unsigned int i = 0; i < numberOfClasses; ++i) {
+            if (class_conformsToProtocol(classes[i], @protocol(UIApplicationDelegate))) {
+                appDelegateClass = classes[i];
+            }
+        }
+        receivedNotifFound = MethodSwizzle(appDelegateClass, @selector(application:didReceiveRemoteNotification:), @selector(application:didReceiveRemoteNotification:));
+
+        registerSuccessMethodFound = MethodSwizzle(appDelegateClass, @selector(application:didRegisterForRemoteNotificationsWithDeviceToken:), @selector(application:didRegisterForRemoteNotificationsWithDeviceToken:));
+
+
+        registeFailMethodFound = MethodSwizzle(appDelegateClass, @selector(application:didFailToRegisterForRemoteNotificationsWithError:), @selector(didFailToRegisterForRemoteNotificationsWithError:));
+
+        receivedNotifFound = MethodSwizzle(appDelegateClass, @selector(applicationDidBecomeActive:), @selector(applicationDidBecomeActive:));
+
+
+        NSLog(@"Register success method found? %d Register fail method found? %d Receive found %d?", registerSuccessMethodFound, registeFailMethodFound , receivedNotifFound);
+
+    });
+}
+
+// Replace or Exchange method implementations
+// Return YES if method was exchanged, NO if replaced
+BOOL MethodSwizzle(Class clazz, SEL originalSelector, SEL overrideSelector)
+{
+    Method originalMethod = class_getInstanceMethod(clazz, originalSelector);
+    Method overrideMethod = class_getInstanceMethod([PushPlugin class], overrideSelector);
+
+    // try to add, if it does not exist, replace
+    if (class_addMethod(clazz, originalSelector, method_getImplementation(overrideMethod), method_getTypeEncoding(overrideMethod))) {
+        class_replaceMethod(clazz, overrideSelector, method_getImplementation(originalMethod), method_getTypeEncoding(originalMethod));
+    }
+    // add failed, so we exchange
+    else {
+        method_exchangeImplementations(originalMethod, overrideMethod);
+        return YES;
+    }
+
+    return NO;
 }
 
 - (void)unregister:(CDVInvokedUrlCommand*)command;
@@ -151,56 +205,83 @@
     }
 }
 
-- (void)init:(CDVInvokedUrlCommand*)command;
+// HS TODO NEED TO TEST THIS - ADDED
+// This code will be called immediately after application:didFinishLaunchingWithOptions:. We need
+// to process notifications in cold-start situations
+- (void)createNotificationChecker:(NSNotification *)notification
+{
+    if (notification)
+    {
+        NSDictionary *launchOptions = [notification userInfo];
+        if (launchOptions)
+            self.launchNotification = [launchOptions objectForKey: @"UIApplicationLaunchOptionsRemoteNotificationKey"];
+    }
+}
+
+// HS TODO NEED TO TEST THIS - ADDED
+// The accessors use an Associative Reference since you can't define a iVar in a category
+// http://developer.apple.com/library/ios/#documentation/cocoa/conceptual/objectivec/Chapters/ocAssociativeReferences.html
+- (NSMutableArray *)launchNotification
+{
+    return objc_getAssociatedObject(self, &launchNotificationKey);
+}
+- (void)setLaunchNotification:(NSDictionary *)aDictionary
+{
+    objc_setAssociatedObject(self, &launchNotificationKey, aDictionary, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+- (void)dealloc
+{
+    self.launchNotification = nil; // clear the association and release the object
+}
+
+- (void)init:(CDVInvokedUrlCommand*)command
 {
     [self.commandDelegate runInBackground:^ {
 
-    NSLog(@"Push Plugin register called");
-    self.callbackId = command.callbackId;
+        NSLog(@"Push Plugin register called");
+        self.callbackId = command.callbackId;
 
-    NSMutableDictionary* options = [command.arguments objectAtIndex:0];
-    NSMutableDictionary* iosOptions = [options objectForKey:@"ios"];
-
-    NSArray* topics = [iosOptions objectForKey:@"topics"];
-    [self setGcmTopics:topics];
+        NSMutableDictionary* options = [command.arguments objectAtIndex:0];
+        NSMutableDictionary* iosOptions = [options objectForKey:@"ios"];
 
 #if __IPHONE_OS_VERSION_MAX_ALLOWED >= 80000
-    UIUserNotificationType UserNotificationTypes = UIUserNotificationTypeNone;
+        UIUserNotificationType UserNotificationTypes = UIUserNotificationTypeNone;
 #endif
-    UIRemoteNotificationType notificationTypes = UIRemoteNotificationTypeNone;
+        UIRemoteNotificationType notificationTypes = UIRemoteNotificationTypeNone;
 
-    id badgeArg = [iosOptions objectForKey:@"badge"];
-    id soundArg = [iosOptions objectForKey:@"sound"];
-    id alertArg = [iosOptions objectForKey:@"alert"];
-    id clearBadgeArg = [iosOptions objectForKey:@"clearBadge"];
+        id badgeArg = [iosOptions objectForKey:@"badge"];
+        id soundArg = [iosOptions objectForKey:@"sound"];
+        id alertArg = [iosOptions objectForKey:@"alert"];
+        id clearBadgeArg = [iosOptions objectForKey:@"clearBadge"];
 
-    if (([badgeArg isKindOfClass:[NSString class]] && [badgeArg isEqualToString:@"true"]) || [badgeArg boolValue])
-    {
-        notificationTypes |= UIRemoteNotificationTypeBadge;
+        if (([badgeArg isKindOfClass:[NSString class]] && [badgeArg isEqualToString:@"true"]) || [badgeArg boolValue])
+        {
+            notificationTypes |= UIRemoteNotificationTypeBadge;
 #if __IPHONE_OS_VERSION_MAX_ALLOWED >= 80000
-        UserNotificationTypes |= UIUserNotificationTypeBadge;
+            UserNotificationTypes |= UIUserNotificationTypeBadge;
 #endif
-    }
+        }
 
-    if (([soundArg isKindOfClass:[NSString class]] && [soundArg isEqualToString:@"true"]) || [soundArg boolValue])
-    {
-        notificationTypes |= UIRemoteNotificationTypeSound;
+        if (([soundArg isKindOfClass:[NSString class]] && [soundArg isEqualToString:@"true"]) || [soundArg boolValue])
+        {
+            notificationTypes |= UIRemoteNotificationTypeSound;
 #if __IPHONE_OS_VERSION_MAX_ALLOWED >= 80000
-        UserNotificationTypes |= UIUserNotificationTypeSound;
+            UserNotificationTypes |= UIUserNotificationTypeSound;
 #endif
-    }
+        }
 
-    if (([alertArg isKindOfClass:[NSString class]] && [alertArg isEqualToString:@"true"]) || [alertArg boolValue])
-    {
-        notificationTypes |= UIRemoteNotificationTypeAlert;
+        if (([alertArg isKindOfClass:[NSString class]] && [alertArg isEqualToString:@"true"]) || [alertArg boolValue])
+        {
+            notificationTypes |= UIRemoteNotificationTypeAlert;
 #if __IPHONE_OS_VERSION_MAX_ALLOWED >= 80000
-        UserNotificationTypes |= UIUserNotificationTypeAlert;
+            UserNotificationTypes |= UIUserNotificationTypeAlert;
 #endif
-    }
+        }
 
-    notificationTypes |= UIRemoteNotificationTypeNewsstandContentAvailability;
+        notificationTypes |= UIRemoteNotificationTypeNewsstandContentAvailability;
 #if __IPHONE_OS_VERSION_MAX_ALLOWED >= 80000
-    UserNotificationTypes |= UIUserNotificationActivationModeBackground;
+        UserNotificationTypes |= UIUserNotificationActivationModeBackground;
 #endif
 
         if (clearBadgeArg == nil || ([clearBadgeArg isKindOfClass:[NSString class]] && [clearBadgeArg isEqualToString:@"false"]) || ![clearBadgeArg boolValue]) {
@@ -213,84 +294,31 @@
         }
         NSLog(@"PushPlugin.register: clear badge is set to %d", clearBadge);
 
-    if (notificationTypes == UIRemoteNotificationTypeNone)
-        NSLog(@"PushPlugin.register: Push notification type is set to none");
+        if (notificationTypes == UIRemoteNotificationTypeNone)
+            NSLog(@"PushPlugin.register: Push notification type is set to none");
 
-    isInline = NO;
+        isInline = NO;
 
         NSLog(@"PushPlugin.register: better button setup");
         // setup action buttons
-        NSMutableSet *categories = [[NSMutableSet alloc] init];
         id categoryOptions = [iosOptions objectForKey:@"categories"];
-        if (categoryOptions != nil && [categoryOptions isKindOfClass:[NSDictionary class]]) {
-            for (id key in categoryOptions) {
-                NSLog(@"categories: key %@", key);
-                id category = [categoryOptions objectForKey:key];
-
-                id yesButton = [category objectForKey:@"yes"];
-                UIMutableUserNotificationAction *yesAction;
-                if (yesButton != nil && [yesButton  isKindOfClass:[NSDictionary class]]) {
-                    yesAction = [self createAction: yesButton];
-                }
-                id noButton = [category objectForKey:@"no"];
-                UIMutableUserNotificationAction *noAction;
-                if (noButton != nil && [noButton  isKindOfClass:[NSDictionary class]]) {
-                    noAction = [self createAction: noButton];
-                }
-                id maybeButton = [category objectForKey:@"maybe"];
-                UIMutableUserNotificationAction *maybeAction;
-                if (maybeButton != nil && [maybeButton  isKindOfClass:[NSDictionary class]]) {
-                    maybeAction = [self createAction: maybeButton];
-                }
-
-                // First create the category
-                UIMutableUserNotificationCategory *notificationCategory = [[UIMutableUserNotificationCategory alloc] init];
-
-                // Identifier to include in your push payload and local notification
-                notificationCategory.identifier = key;
-
-                NSMutableArray *categoryArray = [[NSMutableArray alloc] init];
-                NSMutableArray *minimalCategoryArray = [[NSMutableArray alloc] init];
-                if (yesButton != nil) {
-                    [categoryArray addObject:yesAction];
-                    [minimalCategoryArray addObject:yesAction];
-                }
-                if (noButton != nil) {
-                    [categoryArray addObject:noAction];
-                    [minimalCategoryArray addObject:noAction];
-                }
-                if (maybeButton != nil) {
-                    [categoryArray addObject:maybeAction];
-                }
-
-                // Add the actions to the category and set the action context
-                [notificationCategory setActions:categoryArray forContext:UIUserNotificationActionContextDefault];
-
-                // Set the actions to present in a minimal context
-                [notificationCategory setActions:minimalCategoryArray forContext:UIUserNotificationActionContextMinimal];
-
-                NSLog(@"Adding category %@", key);
-                [categories addObject:notificationCategory];
-            }
-
-        }
-
+        NSMutableSet *categories = [self createCategories: categoryOptions];
 
 #if __IPHONE_OS_VERSION_MAX_ALLOWED >= 80000
-    if ([[UIApplication sharedApplication]respondsToSelector:@selector(registerUserNotificationSettings:)]) {
-        UIUserNotificationSettings *settings = [UIUserNotificationSettings settingsForTypes:UserNotificationTypes categories:categories];
-        [[UIApplication sharedApplication] registerUserNotificationSettings:settings];
-        [[UIApplication sharedApplication] registerForRemoteNotifications];
-    } else {
+        if ([[UIApplication sharedApplication]respondsToSelector:@selector(registerUserNotificationSettings:)]) {
+            UIUserNotificationSettings *settings = [UIUserNotificationSettings settingsForTypes:UserNotificationTypes categories:categories];
+            [[UIApplication sharedApplication] registerUserNotificationSettings:settings];
+            [[UIApplication sharedApplication] registerForRemoteNotifications];
+        } else {
+            [[UIApplication sharedApplication] registerForRemoteNotificationTypes:
+             (UIRemoteNotificationTypeBadge | UIRemoteNotificationTypeSound | UIRemoteNotificationTypeAlert)];
+        }
+#else
         [[UIApplication sharedApplication] registerForRemoteNotificationTypes:
          (UIRemoteNotificationTypeBadge | UIRemoteNotificationTypeSound | UIRemoteNotificationTypeAlert)];
-    }
-#else
-    [[UIApplication sharedApplication] registerForRemoteNotificationTypes:
-     (UIRemoteNotificationTypeBadge | UIRemoteNotificationTypeSound | UIRemoteNotificationTypeAlert)];
 #endif
 
-    //  GCM options
+        //  GCM options
         [self setGcmSenderId: [iosOptions objectForKey:@"senderID"]];
         NSLog(@"GCM Sender ID %@", gcmSenderId);
         if([[self gcmSenderId] length] > 0) {
@@ -301,21 +329,89 @@
             NSLog(@"Using APNS Notification");
             [self setUsesGCM:NO];
         }
-    id gcmSandBoxArg = [iosOptions objectForKey:@"gcmSandbox"];
+        id gcmSandBoxArg = [iosOptions objectForKey:@"gcmSandbox"];
 
-    [self setGcmSandbox:@NO];
-    if ([self usesGCM] &&
-        (([gcmSandBoxArg isKindOfClass:[NSString class]] && [gcmSandBoxArg isEqualToString:@"true"]) ||
-            [gcmSandBoxArg boolValue]))
-    {
-        NSLog(@"Using GCM Sandbox");
-        [self setGcmSandbox:@YES];
-    }
+        [self setGcmSandbox:@NO];
+        if ([self usesGCM] &&
+            (([gcmSandBoxArg isKindOfClass:[NSString class]] && [gcmSandBoxArg isEqualToString:@"true"]) ||
+             [gcmSandBoxArg boolValue]))
+        {
+            NSLog(@"Using GCM Sandbox");
+            [self setGcmSandbox:@YES];
+        }
 
-    if (notificationMessage)			// if there is a pending startup notification
-        [self notificationReceived];	// go ahead and process it
+        if (notificationMessage)			// if there is a pending startup notification
+            [self notificationReceived];	// go ahead and process it
 
     }];
+}
+
+- (NSMutableSet *) createCategories:(NSDictionary *)categoryOptions {
+    NSMutableSet *categories = [[NSMutableSet alloc] init];
+    if (categoryOptions != nil && [categoryOptions isKindOfClass:[NSDictionary class]]) {
+        for (id key in categoryOptions) {
+            NSLog(@"categories: key %@", key);
+            id category = [categoryOptions objectForKey:key];
+
+            id yesButton = [category objectForKey:@"yes"];
+            UIMutableUserNotificationAction *yesAction;
+            if (yesButton != nil && [yesButton  isKindOfClass:[NSDictionary class]]) {
+                yesAction = [self createAction: yesButton];
+            }
+            id noButton = [category objectForKey:@"no"];
+            UIMutableUserNotificationAction *noAction;
+            if (noButton != nil && [noButton  isKindOfClass:[NSDictionary class]]) {
+                noAction = [self createAction: noButton];
+            }
+            id maybeButton = [category objectForKey:@"maybe"];
+            UIMutableUserNotificationAction *maybeAction;
+            if (maybeButton != nil && [maybeButton  isKindOfClass:[NSDictionary class]]) {
+                maybeAction = [self createAction: maybeButton];
+            }
+
+            // First create the category
+            UIMutableUserNotificationCategory *notificationCategory = [[UIMutableUserNotificationCategory alloc] init];
+
+            // Identifier to include in your push payload and local notification
+            notificationCategory.identifier = key;
+
+            NSMutableArray *categoryArray = [[NSMutableArray alloc] init];
+            NSMutableArray *minimalCategoryArray = [[NSMutableArray alloc] init];
+            if (yesButton != nil) {
+                [categoryArray addObject:yesAction];
+                [minimalCategoryArray addObject:yesAction];
+            }
+            if (noButton != nil) {
+                [categoryArray addObject:noAction];
+                [minimalCategoryArray addObject:noAction];
+            }
+            if (maybeButton != nil) {
+                [categoryArray addObject:maybeAction];
+            }
+
+            // Add the actions to the category and set the action context
+            [notificationCategory setActions:categoryArray forContext:UIUserNotificationActionContextDefault];
+
+            // Set the actions to present in a minimal context
+            [notificationCategory setActions:minimalCategoryArray forContext:UIUserNotificationActionContextMinimal];
+
+            NSLog(@"Adding category %@", key);
+            [categories addObject:notificationCategory];
+        }
+    }
+    return categories;
+}
+
+- (void) didFailToRegisterForRemoteNotificationsWithError:(NSError*)error
+{
+    NSLog(@"didFailtoRegisterForRemoteNotificationsWithError");
+    /*if (self.callbackId == nil) {
+        NSLog(@"Unexpected call to didFailToRegisterForRemoteNotificationsWithError, ignoring: %@", error);
+        return;
+    }*/
+    NSLog(@"Push Plugin register failed");
+    [self failWithMessage:@"" withError:error];
+
 }
 
 - (UIMutableUserNotificationAction *)createAction:(NSDictionary *)dictionary {
@@ -342,12 +438,24 @@
     return myAction;
 }
 
-- (void)didRegisterForRemoteNotificationsWithDeviceToken:(NSData *)deviceToken {
-    if (self.callbackId == nil) {
+/*
+ - (void) application:(UIApplication*)app didRegisterForRemoteNotificationsWithDeviceToken:(NSData*)deviceToken
+ {
+ NSLog(@"didRegisterForRemoteNotificationsWithDeviceToken");
+ }
+ */
+//- (void)didRegisterForRemoteNotificationsWithDeviceToken:(NSData *)deviceToken {
+- (void) application:(UIApplication*)app didRegisterForRemoteNotificationsWithDeviceToken:(NSData*)deviceToken
+{
+    // HS TO DO - Fix callback id coming from AppDelegate
+    /*if (self.callbackId == nil) {
         NSLog(@"Unexpected call to didRegisterForRemoteNotificationsWithDeviceToken, ignoring: %@", deviceToken);
         return;
-    }
+    }*/
     NSLog(@"Push Plugin register success: %@", deviceToken);
+
+    //if (registerSuccessMethodFound)
+      //  [self myApplication:application didRegisterForRemoteNotificationsWithDeviceToken:deviceToken];
 
     NSMutableDictionary *results = [NSMutableDictionary dictionary];
     NSString *token = [[[[deviceToken description] stringByReplacingOccurrencesOfString:@"<"withString:@""]
@@ -422,14 +530,94 @@
 #endif
 }
 
-- (void)didFailToRegisterForRemoteNotificationsWithError:(NSError *)error
+- (id) getCommandInstance:(NSString*)className
 {
-    if (self.callbackId == nil) {
-        NSLog(@"Unexpected call to didFailToRegisterForRemoteNotificationsWithError, ignoring: %@", error);
-        return;
+    //[UIApplication sharedApplication].delegate;
+    //[[[UIApplication sharedApplication].keyWindow.rootViewController getCommandInstance:className] ]
+    return [((CDVViewController*)self.viewController)  getCommandInstance:className];
+
+    //return [mvc getCommandInstance:className];
+}
+
+
+- (void)applicationDidBecomeActive:(UIApplication *)application {
+
+    NSLog(@"active");
+    //PushPlugin *pushHandler = getCommandInstance;@"PushNotification";
+    //PushPlugin *pushHandler = [((CDVViewController*)self.viewController) getCommandInstance:@"PushNotification"];
+
+    // TODO - Fix to get current view controller?
+    PushPlugin *pushHandler = [(CDVViewController*)application.keyWindow.rootViewController getCommandInstance:@"PushNotification"];
+
+    if (pushHandler.clearBadge) {
+        NSLog(@"PushPlugin clearing badge");
+        //zero badge
+        application.applicationIconBadgeNumber = 0;
+    } else {
+        NSLog(@"PushPlugin skip clear badge");
     }
-    NSLog(@"Push Plugin register failed");
-    [self failWithMessage:@"" withError:error];
+
+    //if (self.launchNotification) {
+    /*if (pushHandler.launchNotification) {
+        pushHandler.isInline = NO;
+        pushHandler.notificationMessage = self.launchNotification;
+        //self.launchNotification = nil;
+        pushHandler.launchNotification = nil;
+        [pushHandler performSelectorOnMainThread:@selector(notificationReceived) withObject:pushHandler waitUntilDone:NO];
+    }*/
+}
+
+/*- (application:(UIApplication*)app didReceiveRemoteNotification:(NSDictionary *)userInfo fetchCompletionHandler:(void (^)(UIBackgroundFetchResult))completionHandler {*/
+- (void)application:(UIApplication *)application didReceiveRemoteNotification:(NSDictionary *)userInfo fetchCompletionHandler:(void (^)(UIBackgroundFetchResult))backgroundCompletionHandler {
+    NSLog(@"didReceiveNotification with fetchCompletionHandler");
+
+    // app is in the foreground so call notification callback
+    if ([UIApplication sharedApplication].applicationState == UIApplicationStateActive) {
+        NSLog(@"app active");
+        notificationMessage = userInfo;
+        self.isInline = YES;
+        [self notificationReceived];
+
+        //HS TODO - NOT SURE IF completionHandler code is right or working - review all code
+        backgroundCompletionHandler(UIBackgroundFetchResultNewData);
+    }
+    // app is in background or in stand by
+    else {
+        NSLog(@"app inactive");
+
+        // do some convoluted logic to find out if this should be a silent push.
+        long silent = 0;
+        id aps = [userInfo objectForKey:@"aps"];
+        id contentAvailable = [aps objectForKey:@"content-available"];
+        if ([contentAvailable isKindOfClass:[NSString class]] && [contentAvailable isEqualToString:@"1"]) {
+            silent = 1;
+        } else if ([contentAvailable isKindOfClass:[NSNumber class]]) {
+            silent = [contentAvailable integerValue];
+        }
+
+        if (silent == 1) {
+            NSLog(@"this should be a silent push");
+            void (^safeHandler)(UIBackgroundFetchResult) = ^(UIBackgroundFetchResult result){
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    backgroundCompletionHandler(result);
+                });
+            };
+
+            NSMutableDictionary* params = [NSMutableDictionary dictionaryWithCapacity:2];
+            [params setObject:safeHandler forKey:@"handler"];
+
+            notificationMessage = userInfo;
+            self.isInline = NO;
+            self.handlerObj = params;
+            [self notificationReceived];
+        } else {
+            NSLog(@"just put it in the shade");
+            //save it for later
+            self.launchNotification = userInfo;
+
+            backgroundCompletionHandler(UIBackgroundFetchResultNewData);
+        }
+    }
 }
 
 - (void)notificationReceived {
@@ -495,7 +683,7 @@
         [pluginResult setKeepCallbackAsBool:YES];
         [self.commandDelegate sendPluginResult:pluginResult callbackId:self.callbackId];
 
-        self.notificationMessage = nil;
+        notificationMessage = nil;
     }
 }
 
@@ -548,13 +736,17 @@
     [message setObject:token forKey:@"registrationId"];
     CDVPluginResult* pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK messageAsDictionary:message];
     [pluginResult setKeepCallbackAsBool:YES];
-    [self.commandDelegate sendPluginResult:pluginResult callbackId:self.callbackId];
+
+    //HS TODO - this line doesn't work because self is AppDelegate now
+    //[self.commandDelegate sendPluginResult:pluginResult callbackId:self.callbackId];
+    PushPlugin *pushHandler = [(CDVViewController*)[UIApplication sharedApplication].keyWindow.rootViewController getCommandInstance:@"PushNotification"];
+    [pushHandler.commandDelegate sendPluginResult:pluginResult callbackId:pushHandler.callbackId];
 }
 
 
 -(void)failWithMessage:(NSString *)message withError:(NSError *)error
 {
-    NSString        *errorMessage = (error) ? [NSString stringWithFormat:@"%@ - %@", message, [error localizedDescription]] : message;
+    NSString *errorMessage = (error) ? [NSString stringWithFormat:@"%@ - %@", message, [error localizedDescription]] : message;
     CDVPluginResult *commandResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_ERROR messageAsString:errorMessage];
 
     [self.commandDelegate sendPluginResult:commandResult callbackId:self.callbackId];
@@ -597,5 +789,6 @@
         }
     }
 }
+
 
 @end
